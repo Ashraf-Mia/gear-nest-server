@@ -250,6 +250,45 @@ app.get("/equipment/:id", async (req, res) => {
   res.send(equipment);
 });
 
+// Admin only: approve or reject equipment.
+app.patch(
+  "/equipment/:id/status",
+  verifyToken,
+  verifyAdmin,
+  async (req, res) => {
+    if (!ObjectId.isValid(req.params.id)) {
+      return res.status(400).send({ message: "Invalid equipment id" });
+    }
+
+    const { status } = req.body;
+
+    // Only these three values are allowed.
+    if (!["pending", "approved", "rejected"].includes(status)) {
+      return res.status(400).send({ message: "Invalid status" });
+    }
+
+    const equipmentId = new ObjectId(req.params.id);
+    const equipment = await equipmentCollection.findOne({
+      _id: equipmentId,
+    });
+
+    if (!equipment) {
+      return res.status(404).send({ message: "Equipment not found" });
+    }
+
+    await equipmentCollection.updateOne(
+      { _id: equipmentId },
+      { $set: { status } },
+    );
+
+    const updatedEquipment = await equipmentCollection.findOne({
+      _id: equipmentId,
+    });
+
+    res.send(updatedEquipment);
+  },
+);
+
 // This returns the profile of the logged-in user.
 app.get("/profile", verifyToken, async (req, res) => {
   const user = await db.collection("user").findOne({ email: req.user.email });
