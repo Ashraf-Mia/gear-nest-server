@@ -257,6 +257,11 @@ app.get("/profile", verifyToken, async (req, res) => {
   res.send(user);
 });
 
+// This lets an admin get all users.
+app.get("/users", verifyToken, verifyAdmin, async (req, res) => {
+  const result = await usersCollection.find().toArray();
+  res.send(result);
+});
 app.listen(PORT, () => {
   console.log(`Server is running on port ${PORT}`);
 });
