@@ -48,6 +48,14 @@ app.post("/equipment", async (req, res) => {
   res.send(result);
 });
 
+app.get("/equipment", async (req, res) => {
+  const { ownerId } = req.query;
+  const query = ownerId ? { ownerId } : {};
+
+  const result = await equipmentCollection.find(query).toArray();
+  res.send(result);
+});
+
 app.listen(PORT, () => {
   console.log(`Server is running on port ${PORT}`);
 });
