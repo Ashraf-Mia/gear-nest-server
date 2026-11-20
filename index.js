@@ -250,6 +250,13 @@ app.get("/equipment/:id", async (req, res) => {
   res.send(equipment);
 });
 
+// This returns the profile of the logged-in user.
+app.get("/profile", verifyToken, async (req, res) => {
+  const user = await db.collection("user").findOne({ email: req.user.email });
+
+  res.send(user);
+});
+
 app.listen(PORT, () => {
   console.log(`Server is running on port ${PORT}`);
 });
