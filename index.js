@@ -18,10 +18,22 @@ const PORT = process.env.PORT || 5000;
 
 const client = new MongoClient(process.env.MONGODB_URI);
 
+let db;
+
 export async function connectToDatabase() {
+  if (db) {
+    return db;
+  }
+
   try {
     await client.connect();
-    return client;
+    db = client.db("gear-nest");
+
+    await db
+      .collection("payments")
+      .createIndex({ stripeSessionId: 1 }, { unique: true });
+
+    return db;
   } catch (error) {
     console.error("Error connecting to database:", error);
     // Fail fast: the route handlers cannot work without a database.
@@ -29,12 +41,11 @@ export async function connectToDatabase() {
   }
 }
 
-const connectedClient = await connectToDatabase();
-
-const db = connectedClient.db("gear-nest");
+await connectToDatabase();
 const usersCollection = db.collection("user");
 const equipmentCollection = db.collection("equipment");
 const favoritesCollection = db.collection("favorites");
+const paymentsCollection = db.collection("payments");
 
 // Older listings stored the price and quantity as strings, and a few used the
 // old `price`/`quantity` field names. Range filters and sorting only work on
@@ -364,7 +375,9 @@ app.patch("/equipment/:id", verifyToken, verifyOwner, async (req, res) => {
     if (rentalPrice !== undefined) {
       const value = Number(rentalPrice);
       if (!Number.isFinite(value)) {
-        return res.status(400).send({ message: "rentalPrice must be a number" });
+        return res
+          .status(400)
+          .send({ message: "rentalPrice must be a number" });
       }
       fieldsToUpdate.rentalPrice = value;
     }
@@ -613,6 +626,8 @@ app.get("/users", verifyToken, verifyAdmin, async (req, res) => {
 // ---------------------------------------------------------------------------
 // 404 and error handling
 // ---------------------------------------------------------------------------
+
+// ===== Stripe Webhook (express.json() এর আগে) =====
 
 // Unknown routes return JSON instead of Express's default HTML page, so the
 // client never tries to parse HTML as JSON.
