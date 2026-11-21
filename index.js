@@ -915,6 +915,25 @@ app.post("/payments/confirm", verifyToken, verifyRenter, async (req, res) => {
   }
 });
 
+// ===== Customer's bookings route =====
+app.get("/bookings/my", verifyToken, verifyRenter, async (req, res) => {
+  try {
+    const database = await getDB();
+
+    // ইমেইল আসে যাচাই করা টোকেন থেকে, তাই অন্যের booking দেখা যাবে না
+    const result = await database
+      .collection("bookings")
+      .find({ customerEmail: req.user.email })
+      .sort({ createdAt: -1 }) // নতুন booking আগে
+      .toArray();
+
+    res.send(result);
+  } catch (error) {
+    console.log(error);
+    res.status(500).send({ message: "Failed to load bookings" });
+  }
+});
+
 // Unknown routes return JSON instead of Express's default HTML page, so the
 // client never tries to parse HTML as JSON.
 app.use((req, res) => {
