@@ -3,14 +3,37 @@ import cors from "cors";
 import { MongoClient, ObjectId } from "mongodb";
 import dotenv from "dotenv";
 import { createRemoteJWKSet, jwtVerify } from "jose";
+import Stripe from "stripe";
 
 dotenv.config();
 
+// Stripe needs the secret key from .env. This key must never be sent to the
+// browser; only the backend uses it.
+if (!process.env.STRIPE_SECRET_KEY) {
+  throw new Error("STRIPE_SECRET_KEY is missing. Add it to your .env file.");
+}
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+
 const app = express();
 app.use(cors());
+
+// Stripe signs the raw request body. This route must be registered BEFORE
+// express.json(), because the JSON parser would consume the body and the
+// signature check would fail.
+app.post(
+  "/webhook",
+  express.raw({ type: "application/json" }),
+  handleStripeWebhook,
+);
+
 app.use(express.json());
 
 const PORT = process.env.PORT || 5000;
+
+// The browser URL Stripe redirects to after payment. CLIENT_URI is already
+// used by the rest of the server, so we reuse it here.
+const clientUrl = process.env.CLIENT_URI || "http://localhost:3000";
 
 // ---------------------------------------------------------------------------
 // Database
@@ -46,6 +69,12 @@ const usersCollection = db.collection("user");
 const equipmentCollection = db.collection("equipment");
 const favoritesCollection = db.collection("favorites");
 const paymentsCollection = db.collection("payments");
+
+// The app connects to MongoDB once at startup and stores it in `db`.
+// The payment functions use this helper to get that same connection.
+async function getDB() {
+  return db;
+}
 
 // Older listings stored the price and quantity as strings, and a few used the
 // old `price`/`quantity` field names. Range filters and sorting only work on
@@ -627,35 +656,46 @@ app.get("/users", verifyToken, verifyAdmin, async (req, res) => {
 // 404 and error handling
 // ---------------------------------------------------------------------------
 
-// ===== Stripe Webhook  =====
-app.post(
-  "/webhook",
-  express.raw({ type: "application/json" }),
-  async (req, res) => {
-    let event;
-    try {
-      event = stripe.webhooks.constructEvent(
-        req.body,
-        req.headers["stripe-signature"],
-        process.env.STRIPE_WEBHOOK_SECRET,
-      );
-    } catch (error) {
-      return res.status(400).send("Webhook signature failed");
-    }
+// ===== Stripe Webhook =====
+// This function is registered near the top of the file, before
+// express.json(), so req.body is still the raw Stripe payload.
+async function handleStripeWebhook(req, res) {
+  let event;
 
+  try {
+    event = stripe.webhooks.constructEvent(
+      req.body,
+      req.headers["stripe-signature"],
+      process.env.STRIPE_WEBHOOK_SECRET,
+    );
+  } catch (error) {
+    console.error("Webhook signature failed:", error.message);
+    return res.status(400).send("Webhook signature failed");
+  }
+
+  try {
     if (event.type === "checkout.session.completed") {
       await saveBooking(event.data.object);
     }
+
     res.send({ received: true });
-  },
-);
+  } catch (error) {
+    console.error("Webhook handling failed:", error);
+    res.status(500).send("Webhook handling failed");
+  }
+}
 
 // Calculate the number of units (days, weeks, or months) between two dates.
 function getUnits(startDate, endDate, rentalType) {
   const days =
     Math.round((new Date(endDate) - new Date(startDate)) / 86400000) + 1;
-  if (rentalType === "weekly") return Math.ceil(days / 7);
-  if (rentalType === "monthly") return Math.ceil(days / 30);
+
+  // The equipment form saves rentalType as "Daily", "Weekly", or "Monthly".
+  // Lowercasing makes this comparison safe.
+  const type = String(rentalType).toLowerCase();
+
+  if (type === "weekly") return Math.ceil(days / 7);
+  if (type === "monthly") return Math.ceil(days / 30);
   return days;
 }
 
@@ -672,8 +712,10 @@ async function getAvailableQuantity(equipment, startDate, endDate) {
     })
     .toArray();
 
-  const booked = overlapping.reduce((sum, b) => sum + b.quantity, 0);
-  return equipment.quantity - booked;
+  const booked = overlapping.reduce((sum, b) => sum + Number(b.quantity), 0);
+
+  // Equipment stores stock in `availableQuantity`, not `quantity`.
+  return Number(equipment.availableQuantity) - booked;
 }
 
 // Save the booking and payment in the database. Returns the payment document
@@ -785,7 +827,15 @@ app.post("/bookings/checkout", verifyToken, verifyRenter, async (req, res) => {
     }
 
     const units = getUnits(startDate, endDate, equipment.rentalType);
-    const total = equipment.price * units * qty;
+
+    // Equipment stores its price in `rentalPrice`, not `price`.
+    // The server calculates the total so the browser cannot change it.
+    const unitPrice = Number(equipment.rentalPrice);
+    if (!Number.isFinite(unitPrice) || unitPrice <= 0) {
+      return res.status(400).send({ message: "Equipment price is invalid" });
+    }
+
+    const total = unitPrice * units * qty;
 
     const session = await stripe.checkout.sessions.create({
       mode: "payment",
@@ -815,8 +865,8 @@ app.post("/bookings/checkout", verifyToken, verifyRenter, async (req, res) => {
         address: String(address).slice(0, 400),
         notes: String(notes || "").slice(0, 400),
       },
-      success_url: `${process.env.CLIENT_URL}/payment-success?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${process.env.CLIENT_URL}/payment-cancel`,
+      success_url: `${clientUrl}/payment-success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${clientUrl}/payment-cancel`,
     });
 
     res.send({ url: session.url });
@@ -830,24 +880,37 @@ app.post("/bookings/checkout", verifyToken, verifyRenter, async (req, res) => {
 app.post("/payments/confirm", verifyToken, verifyRenter, async (req, res) => {
   try {
     const { sessionId } = req.body;
+
+    // A missing session id would make Stripe throw a confusing error.
+    if (!sessionId) {
+      return res.status(400).send({ message: "Missing session id" });
+    }
+
     const session = await stripe.checkout.sessions.retrieve(sessionId);
 
-    // অন্যের session দিয়ে চেষ্টা করলে আটকাবে
+    // A customer must not be able to confirm someone else's payment.
     if (session.metadata.customerEmail !== req.user.email) {
       return res.status(403).send({ message: "Forbidden" });
     }
+
     if (session.payment_status !== "paid") {
       return res.status(400).send({ message: "Payment not completed" });
     }
 
     const payment = await saveBooking(session);
+
+    // saveBooking returns null if the session is not paid.
+    if (!payment) {
+      return res.status(400).send({ message: "Payment not completed" });
+    }
+
     res.send({
       success: true,
       transactionId: payment.transactionId,
       amount: payment.amount,
     });
   } catch (error) {
-    console.log(error);
+    console.error("Failed to confirm payment:", error);
     res.status(500).send({ message: "Could not confirm payment" });
   }
 });
