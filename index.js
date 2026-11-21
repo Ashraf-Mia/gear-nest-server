@@ -28,6 +28,49 @@ const db = connectedClient.db("gear-nest");
 const usersCollection = db.collection("user");
 const equipmentCollection = db.collection("equipment");
 
+// User input is used inside a RegExp for the search filter. Escaping it stops
+// characters like "(" or "*" from throwing "Invalid regular expression".
+const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+// Older listings stored the price and quantity as strings, and a few used the
+// old `price`/`quantity` field names. Range filters and sorting only work on
+// numbers, so convert them once at startup. Running this again is harmless.
+async function normalizeEquipmentNumbers() {
+  const items = await equipmentCollection
+    .find({
+      $or: [
+        { rentalPrice: { $type: "string" } },
+        { availableQuantity: { $type: "string" } },
+        { rentalPrice: { $exists: false }, price: { $exists: true } },
+        { availableQuantity: { $exists: false }, quantity: { $exists: true } },
+      ],
+    })
+    .toArray();
+
+  for (const item of items) {
+    const rentalPrice = Number(item.rentalPrice ?? item.price);
+    const availableQuantity = Number(item.availableQuantity ?? item.quantity);
+
+    await equipmentCollection.updateOne(
+      { _id: item._id },
+      {
+        $set: {
+          rentalPrice: Number.isFinite(rentalPrice) ? rentalPrice : 0,
+          availableQuantity: Number.isFinite(availableQuantity)
+            ? availableQuantity
+            : 0,
+        },
+      },
+    );
+  }
+
+  if (items.length > 0) {
+    console.log(`Normalized ${items.length} equipment record(s).`);
+  }
+}
+
+await normalizeEquipmentNumbers();
+
 // verifyToken, verifyAdmin, verifyOwner, verifyRenter
 // const { createRemoteJWKSet, jwtVerify } = require("jose");
 
@@ -110,8 +153,21 @@ app.get("/", (req, res) => {
 });
 
 app.post("/equipment", async (req, res) => {
+  // Coerce the two numeric fields so a manual API call cannot store strings
+  // that would later break price/availability filters and sorting.
+  const rentalPrice = Number(req.body.rentalPrice);
+  const availableQuantity = Number(req.body.availableQuantity);
+
+  if (!Number.isFinite(rentalPrice) || !Number.isFinite(availableQuantity)) {
+    return res.status(400).send({
+      message: "rentalPrice and availableQuantity must be numbers",
+    });
+  }
+
   const equipment = {
     ...req.body,
+    rentalPrice,
+    availableQuantity,
     status: "pending",
     createdAt: new Date(),
   };
@@ -121,12 +177,80 @@ app.post("/equipment", async (req, res) => {
 });
 
 // Public list. Customers and guests only see approved equipment.
+// There used to be a second GET /equipment further down that returned a bare
+// array, but Express only runs the first matching route, so the client always
+// received an array instead of { equipment, total, page, totalPages } and
+// crashed on `data.equipment.length`. This is now the only list route.
 app.get("/equipment", async (req, res) => {
-  const result = await equipmentCollection
-    .find({ status: "approved" })
-    .toArray();
+  try {
+    const {
+      search,
+      category,
+      rentalType,
+      minPrice,
+      maxPrice,
+      availability,
+      sort,
+      page = "1",
+      limit = "9",
+    } = req.query;
 
-  res.send(result);
+    // ১. শুধু approved equipment দেখাবে
+    const query = { status: "approved" };
+
+    // ২. সার্চ: নাম অথবা লোকেশন (বড়/ছোট হাতের অক্ষর কোনো ব্যাপার না)
+    if (search) {
+      const regex = new RegExp(escapeRegex(String(search)), "i");
+      query.$or = [{ name: regex }, { location: regex }];
+    }
+
+    // ৩. ক্যাটাগরি ও রেন্টাল টাইপ ফিল্টার
+    if (category) query.category = category;
+    if (rentalType) query.rentalType = rentalType;
+
+    // ৪. প্রাইস রেঞ্জ. Equipment documents store `rentalPrice`, not `price`,
+    //    so the old `query.price` filter never matched anything. Invalid
+    //    numbers are ignored instead of becoming NaN in the Mongo query.
+    const min = Number(minPrice);
+    const max = Number(maxPrice);
+    const priceFilter = {};
+    if (Number.isFinite(min)) priceFilter.$gte = min;
+    if (Number.isFinite(max)) priceFilter.$lte = max;
+    if (Object.keys(priceFilter).length > 0) query.rentalPrice = priceFilter;
+
+    // ৫. Availability. The add/edit forms save `availableQuantity`; the old
+    //    `quantity` field is never written, so it is no longer used here.
+    if (availability === "available") query.availableQuantity = { $gt: 0 };
+    if (availability === "unavailable") query.availableQuantity = { $lte: 0 };
+
+    // ৬. সর্টিং (1 = ছোট থেকে বড়, -1 = বড় থেকে ছোট)
+    let sortOption = { createdAt: -1 }; // ডিফল্ট: নতুন আগে
+    if (sort === "price-low") sortOption = { rentalPrice: 1 };
+    if (sort === "price-high") sortOption = { rentalPrice: -1 };
+
+    // ৭. পেজিনেশন
+    const pageNumber = Math.max(Number(page) || 1, 1);
+    const limitNumber = Math.max(Number(limit) || 9, 1);
+    const skip = (pageNumber - 1) * limitNumber;
+
+    const total = await equipmentCollection.countDocuments(query);
+    const equipment = await equipmentCollection
+      .find(query)
+      .sort(sortOption)
+      .skip(skip)
+      .limit(limitNumber)
+      .toArray();
+
+    res.json({
+      equipment,
+      total,
+      page: pageNumber,
+      totalPages: Math.ceil(total / limitNumber),
+    });
+  } catch (error) {
+    console.error("Failed to load equipment:", error);
+    res.status(500).json({ message: "Failed to load equipment" });
+  }
 });
 
 // The logged-in owner's equipment.
@@ -169,9 +293,23 @@ app.patch("/equipment/:id", verifyToken, verifyOwner, async (req, res) => {
     const fieldsToUpdate = {};
     if (name !== undefined) fieldsToUpdate.name = name;
     if (category !== undefined) fieldsToUpdate.category = category;
-    if (rentalPrice !== undefined) fieldsToUpdate.rentalPrice = rentalPrice;
+    // Numbers are enforced here as well, so an edit cannot turn the price or
+    // quantity back into a string.
+    if (rentalPrice !== undefined) {
+      const value = Number(rentalPrice);
+      if (!Number.isFinite(value)) {
+        return res.status(400).send({ message: "rentalPrice must be a number" });
+      }
+      fieldsToUpdate.rentalPrice = value;
+    }
     if (availableQuantity !== undefined) {
-      fieldsToUpdate.availableQuantity = availableQuantity;
+      const value = Number(availableQuantity);
+      if (!Number.isFinite(value)) {
+        return res
+          .status(400)
+          .send({ message: "availableQuantity must be a number" });
+      }
+      fieldsToUpdate.availableQuantity = value;
     }
 
     if (Object.keys(fieldsToUpdate).length === 0) {
@@ -301,6 +439,7 @@ app.get("/users", verifyToken, verifyAdmin, async (req, res) => {
   const result = await usersCollection.find().toArray();
   res.send(result);
 });
+
 app.listen(PORT, () => {
   console.log(`Server is running on port ${PORT}`);
 });
