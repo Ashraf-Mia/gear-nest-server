@@ -2,23 +2,30 @@ import express from "express";
 import cors from "cors";
 import { MongoClient, ObjectId } from "mongodb";
 import dotenv from "dotenv";
-// import { router } from "./routes/index.js";
 import { createRemoteJWKSet, jwtVerify } from "jose";
+
 dotenv.config();
 
 const app = express();
 app.use(cors());
 app.use(express.json());
-// app.use(router);
+
 const PORT = process.env.PORT || 5000;
 
+// ---------------------------------------------------------------------------
+// Database
+// ---------------------------------------------------------------------------
+
 const client = new MongoClient(process.env.MONGODB_URI);
+
 export async function connectToDatabase() {
   try {
     await client.connect();
     return client;
   } catch (error) {
     console.error("Error connecting to database:", error);
+    // Fail fast: the route handlers cannot work without a database.
+    throw error;
   }
 }
 
@@ -27,10 +34,7 @@ const connectedClient = await connectToDatabase();
 const db = connectedClient.db("gear-nest");
 const usersCollection = db.collection("user");
 const equipmentCollection = db.collection("equipment");
-
-// User input is used inside a RegExp for the search filter. Escaping it stops
-// characters like "(" or "*" from throwing "Invalid regular expression".
-const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const favoritesCollection = db.collection("favorites");
 
 // Older listings stored the price and quantity as strings, and a few used the
 // old `price`/`quantity` field names. Range filters and sorting only work on
@@ -71,12 +75,38 @@ async function normalizeEquipmentNumbers() {
 
 await normalizeEquipmentNumbers();
 
-// verifyToken, verifyAdmin, verifyOwner, verifyRenter
-// const { createRemoteJWKSet, jwtVerify } = require("jose");
+// A customer can favorite an item only once. The unique index also protects
+// against two rapid clicks racing each other.
+try {
+  await favoritesCollection.createIndex(
+    { userEmail: 1, equipmentId: 1 },
+    { unique: true },
+  );
+} catch (error) {
+  // Do not stop the API if the index already exists with different options or
+  // if legacy duplicate rows are present; the toggle route still checks first.
+  console.error("Could not create the favorites index:", error);
+}
 
-const JWKS = createRemoteJWKSet(
-  new URL(`${process.env.AUTH_URL}/api/auth/jwks`),
-);
+// ---------------------------------------------------------------------------
+// Authentication and role middleware
+// ---------------------------------------------------------------------------
+
+const AUTH_URL = process.env.AUTH_URL;
+
+if (!AUTH_URL) {
+  throw new Error("AUTH_URL is required to verify access tokens.");
+}
+
+// Better Auth publishes its JWKS at this URL. createRemoteJWKSet caches the
+// keys and refreshes them when needed, so this is safe to create once.
+const JWKS = createRemoteJWKSet(new URL(`${AUTH_URL}/api/auth/jwks`));
+
+const verifyJwt = (token) =>
+  jwtVerify(token, JWKS, {
+    issuer: AUTH_URL,
+    audience: AUTH_URL,
+  });
 
 const verifyToken = async (req, res, next) => {
   const authHeader = req.headers.authorization;
@@ -88,11 +118,7 @@ const verifyToken = async (req, res, next) => {
   const token = authHeader.split(" ")[1];
 
   try {
-    const { payload } = await jwtVerify(token, JWKS, {
-      issuer: process.env.AUTH_URL,
-      audience: process.env.AUTH_URL,
-    });
-
+    const { payload } = await verifyJwt(token);
     req.user = payload;
     next();
   } catch (error) {
@@ -111,11 +137,7 @@ const getOptionalUser = async (req) => {
 
   try {
     const token = authHeader.split(" ")[1];
-    const { payload } = await jwtVerify(token, JWKS, {
-      issuer: process.env.AUTH_URL,
-      audience: process.env.AUTH_URL,
-    });
-
+    const { payload } = await verifyJwt(token);
     return payload;
   } catch {
     return null;
@@ -146,11 +168,26 @@ const verifyRenter = (req, res, next) => {
   next();
 };
 
-// start server
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+// User input is used inside a RegExp for the search filter. Escaping it stops
+// characters like "(" or "*" from throwing "Invalid regular expression".
+const escapeRegex = (value) =>
+  String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+// ---------------------------------------------------------------------------
+// Health check
+// ---------------------------------------------------------------------------
 
 app.get("/", (req, res) => {
   res.send("Server is running");
 });
+
+// ---------------------------------------------------------------------------
+// Equipment routes
+// ---------------------------------------------------------------------------
 
 app.post("/equipment", async (req, res) => {
   // Coerce the two numeric fields so a manual API call cannot store strings
@@ -176,11 +213,9 @@ app.post("/equipment", async (req, res) => {
   res.send(result);
 });
 
-// Public list. Customers and guests only see approved equipment.
-// There used to be a second GET /equipment further down that returned a bare
-// array, but Express only runs the first matching route, so the client always
-// received an array instead of { equipment, total, page, totalPages } and
-// crashed on `data.equipment.length`. This is now the only list route.
+// Public list. Customers and guests only see approved equipment. This is the
+// only list route: it returns { equipment, total, page, totalPages }, which the
+// client depends on.
 app.get("/equipment", async (req, res) => {
   try {
     const {
@@ -195,22 +230,21 @@ app.get("/equipment", async (req, res) => {
       limit = "9",
     } = req.query;
 
-    // ১. শুধু approved equipment দেখাবে
+    // 1. Only approved equipment is public.
     const query = { status: "approved" };
 
-    // ২. সার্চ: নাম অথবা লোকেশন (বড়/ছোট হাতের অক্ষর কোনো ব্যাপার না)
+    // 2. Search by name or location (case-insensitive).
     if (search) {
-      const regex = new RegExp(escapeRegex(String(search)), "i");
+      const regex = new RegExp(escapeRegex(search), "i");
       query.$or = [{ name: regex }, { location: regex }];
     }
 
-    // ৩. ক্যাটাগরি ও রেন্টাল টাইপ ফিল্টার
+    // 3. Category and rental type filters.
     if (category) query.category = category;
     if (rentalType) query.rentalType = rentalType;
 
-    // ৪. প্রাইস রেঞ্জ. Equipment documents store `rentalPrice`, not `price`,
-    //    so the old `query.price` filter never matched anything. Invalid
-    //    numbers are ignored instead of becoming NaN in the Mongo query.
+    // 4. Price range. Equipment documents store `rentalPrice`, not `price`.
+    //    Invalid numbers are ignored instead of becoming NaN in the query.
     const min = Number(minPrice);
     const max = Number(maxPrice);
     const priceFilter = {};
@@ -218,17 +252,16 @@ app.get("/equipment", async (req, res) => {
     if (Number.isFinite(max)) priceFilter.$lte = max;
     if (Object.keys(priceFilter).length > 0) query.rentalPrice = priceFilter;
 
-    // ৫. Availability. The add/edit forms save `availableQuantity`; the old
-    //    `quantity` field is never written, so it is no longer used here.
+    // 5. Availability uses `availableQuantity` (the field the forms save).
     if (availability === "available") query.availableQuantity = { $gt: 0 };
     if (availability === "unavailable") query.availableQuantity = { $lte: 0 };
 
-    // ৬. সর্টিং (1 = ছোট থেকে বড়, -1 = বড় থেকে ছোট)
-    let sortOption = { createdAt: -1 }; // ডিফল্ট: নতুন আগে
+    // 6. Sorting (1 = ascending, -1 = descending).
+    let sortOption = { createdAt: -1 };
     if (sort === "price-low") sortOption = { rentalPrice: 1 };
     if (sort === "price-high") sortOption = { rentalPrice: -1 };
 
-    // ৭. পেজিনেশন
+    // 7. Pagination.
     const pageNumber = Math.max(Number(page) || 1, 1);
     const limitNumber = Math.max(Number(limit) || 9, 1);
     const skip = (pageNumber - 1) * limitNumber;
@@ -254,8 +287,6 @@ app.get("/equipment", async (req, res) => {
 });
 
 // The logged-in owner's equipment.
-// verifyToken reads the JWT and puts the user's details in req.user.
-// verifyOwner makes sure the user has the "owner" role.
 app.get("/equipment/my", verifyToken, verifyOwner, async (req, res) => {
   const result = await equipmentCollection
     .find({ ownerEmail: req.user.email })
@@ -264,10 +295,45 @@ app.get("/equipment/my", verifyToken, verifyOwner, async (req, res) => {
   res.send(result);
 });
 
+// Admin only: approve or reject equipment.
+app.patch(
+  "/equipment/:id/status",
+  verifyToken,
+  verifyAdmin,
+  async (req, res) => {
+    if (!ObjectId.isValid(req.params.id)) {
+      return res.status(400).send({ message: "Invalid equipment id" });
+    }
+
+    const { status } = req.body;
+
+    if (!["pending", "approved", "rejected"].includes(status)) {
+      return res.status(400).send({ message: "Invalid status" });
+    }
+
+    const equipmentId = new ObjectId(req.params.id);
+    const equipment = await equipmentCollection.findOne({ _id: equipmentId });
+
+    if (!equipment) {
+      return res.status(404).send({ message: "Equipment not found" });
+    }
+
+    await equipmentCollection.updateOne(
+      { _id: equipmentId },
+      { $set: { status } },
+    );
+
+    const updatedEquipment = await equipmentCollection.findOne({
+      _id: equipmentId,
+    });
+
+    res.send(updatedEquipment);
+  },
+);
+
 // Update one equipment item. Only its owner can update it.
 app.patch("/equipment/:id", verifyToken, verifyOwner, async (req, res) => {
   try {
-    // MongoDB ids have a special format. Check it before using it.
     if (!ObjectId.isValid(req.params.id)) {
       return res.status(400).send({ message: "Invalid equipment id" });
     }
@@ -289,11 +355,11 @@ app.patch("/equipment/:id", verifyToken, verifyOwner, async (req, res) => {
     // Only these fields can be changed from the dashboard.
     const { name, category, rentalPrice, availableQuantity } = req.body;
 
-    // যে ফিল্ডগুলো পাঠানো হয়েছে শুধু সেগুলোই $set অবজেক্টে রাখা হবে
     const fieldsToUpdate = {};
     if (name !== undefined) fieldsToUpdate.name = name;
     if (category !== undefined) fieldsToUpdate.category = category;
-    // Numbers are enforced here as well, so an edit cannot turn the price or
+
+    // Numbers are enforced here too, so an edit cannot turn the price or
     // quantity back into a string.
     if (rentalPrice !== undefined) {
       const value = Number(rentalPrice);
@@ -330,6 +396,7 @@ app.patch("/equipment/:id", verifyToken, verifyOwner, async (req, res) => {
 
     res.send(updatedEquipment);
   } catch (error) {
+    console.error("Failed to update equipment:", error);
     res.status(500).send({ message: "Failed to update equipment" });
   }
 });
@@ -388,48 +455,151 @@ app.get("/equipment/:id", async (req, res) => {
   res.send(equipment);
 });
 
-// Admin only: approve or reject equipment.
-app.patch(
-  "/equipment/:id/status",
-  verifyToken,
-  verifyAdmin,
-  async (req, res) => {
-    if (!ObjectId.isValid(req.params.id)) {
-      return res.status(400).send({ message: "Invalid equipment id" });
+// ---------------------------------------------------------------------------
+// Favorites routes (customer only)
+// ---------------------------------------------------------------------------
+
+// GET /favorites -> approved equipment saved by this customer, newest first.
+app.get("/favorites", verifyToken, verifyRenter, async (req, res) => {
+  try {
+    const favorites = await favoritesCollection
+      .find({ userEmail: req.user.email })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    if (favorites.length === 0) {
+      return res.json([]);
     }
 
-    const { status } = req.body;
+    const equipmentIds = favorites.map((favorite) => favorite.equipmentId);
+    const equipment = await equipmentCollection
+      .find({ _id: { $in: equipmentIds }, status: "approved" })
+      .toArray();
 
-    // Only these three values are allowed.
-    if (!["pending", "approved", "rejected"].includes(status)) {
-      return res.status(400).send({ message: "Invalid status" });
-    }
+    // The database does not guarantee the same order as the favorites list,
+    // so rebuild it and drop items that were deleted or unapproved.
+    const equipmentById = new Map(
+      equipment.map((item) => [String(item._id), item]),
+    );
+    const result = favorites
+      .map((favorite) => equipmentById.get(String(favorite.equipmentId)))
+      .filter(Boolean);
 
-    const equipmentId = new ObjectId(req.params.id);
+    res.json(result);
+  } catch (error) {
+    console.error("Failed to load favorites:", error);
+    res.status(500).json({ message: "Failed to load favorites" });
+  }
+});
+
+// GET /favorites/check?equipmentId=... -> used by the details page on load so
+// the heart button is correct even after a hard refresh.
+app.get("/favorites/check", verifyToken, verifyRenter, async (req, res) => {
+  const equipmentId = String(req.query.equipmentId ?? "");
+
+  if (!ObjectId.isValid(equipmentId)) {
+    return res.status(400).json({ message: "Invalid equipment id" });
+  }
+
+  try {
+    const favorite = await favoritesCollection.findOne({
+      userEmail: req.user.email,
+      equipmentId: new ObjectId(equipmentId),
+    });
+
+    res.json({ favorited: Boolean(favorite) });
+  } catch (error) {
+    console.error("Failed to check favorite:", error);
+    res.status(500).json({ message: "Failed to check favorite" });
+  }
+});
+
+// POST /favorites/toggle { equipmentId } -> add or remove in one call.
+// The unique index on { userEmail, equipmentId } prevents duplicates.
+app.post("/favorites/toggle", verifyToken, verifyRenter, async (req, res) => {
+  const equipmentId = String(req.body?.equipmentId ?? "");
+
+  if (!ObjectId.isValid(equipmentId)) {
+    return res.status(400).json({ message: "Invalid equipment id" });
+  }
+
+  try {
+    const id = new ObjectId(equipmentId);
+
+    // Customers can only favorite approved equipment. The 404 also avoids
+    // revealing unapproved listings.
     const equipment = await equipmentCollection.findOne({
-      _id: equipmentId,
+      _id: id,
+      status: "approved",
     });
 
     if (!equipment) {
-      return res.status(404).send({ message: "Equipment not found" });
+      return res.status(404).json({ message: "Equipment not found" });
     }
 
-    await equipmentCollection.updateOne(
-      { _id: equipmentId },
-      { $set: { status } },
-    );
-
-    const updatedEquipment = await equipmentCollection.findOne({
-      _id: equipmentId,
+    const existing = await favoritesCollection.findOne({
+      userEmail: req.user.email,
+      equipmentId: id,
     });
 
-    res.send(updatedEquipment);
+    if (existing) {
+      await favoritesCollection.deleteOne({ _id: existing._id });
+      return res.json({ favorited: false });
+    }
+
+    try {
+      await favoritesCollection.insertOne({
+        userEmail: req.user.email,
+        equipmentId: id,
+        createdAt: new Date(),
+      });
+    } catch (error) {
+      // 11000 = duplicate key. A second click raced the first insert; the
+      // end state the customer wanted is still "favorited", so ignore it.
+      if (error?.code !== 11000) throw error;
+    }
+
+    res.json({ favorited: true });
+  } catch (error) {
+    console.error("Failed to toggle favorite:", error);
+    res.status(500).json({ message: "Failed to update favorite" });
+  }
+});
+
+// DELETE /favorites/:equipmentId -> explicit remove used by the dashboard.
+// Deleting a missing favorite is still a success (idempotent).
+app.delete(
+  "/favorites/:equipmentId",
+  verifyToken,
+  verifyRenter,
+  async (req, res) => {
+    const { equipmentId } = req.params;
+
+    if (!ObjectId.isValid(equipmentId)) {
+      return res.status(400).json({ message: "Invalid equipment id" });
+    }
+
+    try {
+      await favoritesCollection.deleteOne({
+        userEmail: req.user.email,
+        equipmentId: new ObjectId(equipmentId),
+      });
+
+      res.json({ favorited: false });
+    } catch (error) {
+      console.error("Failed to remove favorite:", error);
+      res.status(500).json({ message: "Failed to remove favorite" });
+    }
   },
 );
 
+// ---------------------------------------------------------------------------
+// Profile and users
+// ---------------------------------------------------------------------------
+
 // This returns the profile of the logged-in user.
 app.get("/profile", verifyToken, async (req, res) => {
-  const user = await db.collection("user").findOne({ email: req.user.email });
+  const user = await usersCollection.findOne({ email: req.user.email });
 
   res.send(user);
 });
@@ -438,6 +608,28 @@ app.get("/profile", verifyToken, async (req, res) => {
 app.get("/users", verifyToken, verifyAdmin, async (req, res) => {
   const result = await usersCollection.find().toArray();
   res.send(result);
+});
+
+// ---------------------------------------------------------------------------
+// 404 and error handling
+// ---------------------------------------------------------------------------
+
+// Unknown routes return JSON instead of Express's default HTML page, so the
+// client never tries to parse HTML as JSON.
+app.use((req, res) => {
+  res.status(404).json({ message: "Route not found" });
+});
+
+// Express 5 forwards rejected async handlers here. Log the real error but do
+// not leak internals to the client.
+app.use((error, req, res, next) => {
+  // A malformed JSON body is a client error, not a server failure.
+  if (error?.type === "entity.parse.failed") {
+    return res.status(400).json({ message: "Invalid JSON body" });
+  }
+
+  console.error("Unhandled server error:", error);
+  res.status(500).json({ message: "Internal server error" });
 });
 
 app.listen(PORT, () => {
