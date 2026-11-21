@@ -627,7 +627,54 @@ app.get("/users", verifyToken, verifyAdmin, async (req, res) => {
 // 404 and error handling
 // ---------------------------------------------------------------------------
 
-// ===== Stripe Webhook (express.json() এর আগে) =====
+// ===== Stripe Webhook  =====
+app.post(
+  "/webhook",
+  express.raw({ type: "application/json" }),
+  async (req, res) => {
+    let event;
+    try {
+      event = stripe.webhooks.constructEvent(
+        req.body,
+        req.headers["stripe-signature"],
+        process.env.STRIPE_WEBHOOK_SECRET,
+      );
+    } catch (error) {
+      return res.status(400).send("Webhook signature failed");
+    }
+
+    if (event.type === "checkout.session.completed") {
+      await saveBooking(event.data.object);
+    }
+    res.send({ received: true });
+  },
+);
+
+// Calculate the number of units (days, weeks, or months) between two dates.
+function getUnits(startDate, endDate, rentalType) {
+  const days =
+    Math.round((new Date(endDate) - new Date(startDate)) / 86400000) + 1;
+  if (rentalType === "weekly") return Math.ceil(days / 7);
+  if (rentalType === "monthly") return Math.ceil(days / 30);
+  return days;
+}
+
+// Check how many units of the equipment are available for the requested dates.
+async function getAvailableQuantity(equipment, startDate, endDate) {
+  const database = await getDB();
+  const overlapping = await database
+    .collection("bookings")
+    .find({
+      equipmentId: equipment._id.toString(),
+      bookingStatus: "confirmed",
+      startDate: { $lte: endDate }, // আগের booking নতুনের শেষের আগে শুরু
+      endDate: { $gte: startDate }, // এবং নতুনের শুরুর পরে শেষ = overlap
+    })
+    .toArray();
+
+  const booked = overlapping.reduce((sum, b) => sum + b.quantity, 0);
+  return equipment.quantity - booked;
+}
 
 // Unknown routes return JSON instead of Express's default HTML page, so the
 // client never tries to parse HTML as JSON.
