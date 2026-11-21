@@ -667,14 +667,190 @@ async function getAvailableQuantity(equipment, startDate, endDate) {
     .find({
       equipmentId: equipment._id.toString(),
       bookingStatus: "confirmed",
-      startDate: { $lte: endDate }, // আগের booking নতুনের শেষের আগে শুরু
-      endDate: { $gte: startDate }, // এবং নতুনের শুরুর পরে শেষ = overlap
+      startDate: { $lte: endDate },
+      endDate: { $gte: startDate },
     })
     .toArray();
 
   const booked = overlapping.reduce((sum, b) => sum + b.quantity, 0);
   return equipment.quantity - booked;
 }
+
+// Save the booking and payment in the database. Returns the payment document
+// or null if the payment was not successful. This is called from the Stripe
+// webhook, so it must be idempotent: the same session may be sent twice.
+async function saveBooking(session) {
+  if (session.payment_status !== "paid") return null;
+
+  const database = await getDB();
+  const payments = database.collection("payments");
+  const m = session.metadata;
+
+  const payment = {
+    stripeSessionId: session.id,
+    transactionId: session.payment_intent,
+    amount: session.amount_total / 100,
+    currency: session.currency,
+    customerEmail: m.customerEmail,
+    paidAt: new Date().toISOString(),
+  };
+
+  try {
+    await payments.insertOne(payment);
+  } catch (error) {
+    if (error.code === 11000) {
+      return payments.findOne({ stripeSessionId: session.id });
+    }
+    throw error;
+  }
+
+  const result = await database.collection("bookings").insertOne({
+    equipmentId: m.equipmentId,
+    equipmentName: m.equipmentName,
+    customerEmail: m.customerEmail,
+    customerName: m.customerName,
+    ownerEmail: m.ownerEmail,
+    startDate: m.startDate,
+    endDate: m.endDate,
+    quantity: Number(m.quantity),
+    totalAmount: payment.amount,
+    contact: m.contact,
+    address: m.address,
+    notes: m.notes,
+    paymentStatus: "paid",
+    bookingStatus: "confirmed",
+    createdAt: new Date().toISOString(),
+  });
+
+  payment.bookingId = result.insertedId.toString();
+  await payments.updateOne(
+    { _id: payment._id },
+    { $set: { bookingId: payment.bookingId } },
+  );
+
+  return payment;
+}
+
+// ===== Checkout route =====
+app.post("/bookings/checkout", verifyToken, verifyRenter, async (req, res) => {
+  try {
+    const {
+      equipmentId,
+      startDate,
+      endDate,
+      quantity,
+      contact,
+      address,
+      notes,
+    } = req.body;
+    const qty = Number(quantity);
+    const today = new Date().toISOString().slice(0, 10);
+
+    if (!ObjectId.isValid(equipmentId)) {
+      return res.status(400).send({ message: "Invalid equipment" });
+    }
+    if (!startDate || !endDate || !contact || !address) {
+      return res
+        .status(400)
+        .send({ message: "Please fill all required fields" });
+    }
+    if (!Number.isInteger(qty) || qty < 1) {
+      return res.status(400).send({ message: "Quantity must be at least 1" });
+    }
+    if (startDate < today) {
+      return res
+        .status(400)
+        .send({ message: "Start date cannot be in the past" });
+    }
+    if (endDate < startDate) {
+      return res
+        .status(400)
+        .send({ message: "End date must be after start date" });
+    }
+
+    const database = await getDB();
+    const equipment = await database
+      .collection("equipment")
+      .findOne({ _id: new ObjectId(equipmentId), status: "approved" });
+
+    if (!equipment) {
+      return res.status(404).send({ message: "Equipment not found" });
+    }
+
+    const available = await getAvailableQuantity(equipment, startDate, endDate);
+    if (qty > available) {
+      return res.status(400).send({
+        message: `Only ${Math.max(available, 0)} available for these dates`,
+      });
+    }
+
+    const units = getUnits(startDate, endDate, equipment.rentalType);
+    const total = equipment.price * units * qty;
+
+    const session = await stripe.checkout.sessions.create({
+      mode: "payment",
+      customer_email: req.user.email,
+      line_items: [
+        {
+          quantity: 1,
+          price_data: {
+            currency: "usd",
+            unit_amount: Math.round(total * 100),
+            product_data: {
+              name: `${equipment.name} (${startDate} to ${endDate}) x${qty}`,
+            },
+          },
+        },
+      ],
+      metadata: {
+        equipmentId,
+        equipmentName: equipment.name.slice(0, 100),
+        ownerEmail: equipment.ownerEmail,
+        customerEmail: req.user.email,
+        customerName: String(req.user.name || ""),
+        startDate,
+        endDate,
+        quantity: String(qty),
+        contact: String(contact).slice(0, 30),
+        address: String(address).slice(0, 400),
+        notes: String(notes || "").slice(0, 400),
+      },
+      success_url: `${process.env.CLIENT_URL}/payment-success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${process.env.CLIENT_URL}/payment-cancel`,
+    });
+
+    res.send({ url: session.url });
+  } catch (error) {
+    console.log(error);
+    res.status(500).send({ message: "Could not start payment" });
+  }
+});
+
+// ===== Confirm payment route =====
+app.post("/payments/confirm", verifyToken, verifyRenter, async (req, res) => {
+  try {
+    const { sessionId } = req.body;
+    const session = await stripe.checkout.sessions.retrieve(sessionId);
+
+    // অন্যের session দিয়ে চেষ্টা করলে আটকাবে
+    if (session.metadata.customerEmail !== req.user.email) {
+      return res.status(403).send({ message: "Forbidden" });
+    }
+    if (session.payment_status !== "paid") {
+      return res.status(400).send({ message: "Payment not completed" });
+    }
+
+    const payment = await saveBooking(session);
+    res.send({
+      success: true,
+      transactionId: payment.transactionId,
+      amount: payment.amount,
+    });
+  } catch (error) {
+    console.log(error);
+    res.status(500).send({ message: "Could not confirm payment" });
+  }
+});
 
 // Unknown routes return JSON instead of Express's default HTML page, so the
 // client never tries to parse HTML as JSON.
