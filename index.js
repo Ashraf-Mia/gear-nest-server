@@ -1121,6 +1121,16 @@ app.patch("/profile", verifyToken, async (req, res) => {
   const updatedUser = await userCollection.findOne({ email: req.user.email });
   res.send(updatedUser);
 });
+
+// Logged-in owner: own bookings
+app.get("/bookings/owner", verifyToken, verifyOwner, async (req, res) => {
+  const result = await bookingCollection
+    .find({ ownerEmail: req.user.email })
+    .sort({ createdAt: -1 })
+    .toArray();
+
+  res.send(result);
+});
 // Unknown routes return JSON instead of Express's default HTML page, so the
 // client never tries to parse HTML as JSON.
 app.use((req, res) => {
