@@ -956,6 +956,43 @@ app.get("/bookings/my", verifyToken, verifyRenter, async (req, res) => {
   }
 });
 
+// Logged-in user: own profile
+app.get("/profile", verifyToken, async (req, res) => {
+  const user = await userCollection.findOne({ email: req.user.email });
+
+  if (!user) {
+    return res.status(404).send({ message: "User not found" });
+  }
+
+  res.send(user);
+});
+
+// Logged-in user: update own profile
+app.patch("/profile", verifyToken, async (req, res) => {
+  const { name, image, phone, address } = req.body;
+
+  if (!name || name.trim().length < 2) {
+    return res
+      .status(400)
+      .send({ message: "Name must be at least 2 characters" });
+  }
+
+  await usersCollection.updateOne(
+    { email: req.user.email },
+    {
+      $set: {
+        name: name.trim(),
+        image: image || "",
+        phone: phone || "",
+        address: address || "",
+        updatedAt: new Date(),
+      },
+    },
+  );
+
+  const updatedUser = await userCollection.findOne({ email: req.user.email });
+  res.send(updatedUser);
+});
 // Unknown routes return JSON instead of Express's default HTML page, so the
 // client never tries to parse HTML as JSON.
 app.use((req, res) => {
