@@ -7,8 +7,6 @@ import Stripe from "stripe";
 
 dotenv.config();
 
-// Stripe needs the secret key from .env. This key must never be sent to the
-// browser; only the backend uses it.
 if (!process.env.STRIPE_SECRET_KEY) {
   throw new Error("STRIPE_SECRET_KEY is missing. Add it to your .env file.");
 }
@@ -18,9 +16,6 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 const app = express();
 app.use(cors());
 
-// Stripe signs the raw request body. This route must be registered BEFORE
-// express.json(), because the JSON parser would consume the body and the
-// signature check would fail.
 app.post(
   "/webhook",
   express.raw({ type: "application/json" }),
@@ -31,13 +26,7 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 5000;
 
-// The browser URL Stripe redirects to after payment. CLIENT_URI is already
-// used by the rest of the server, so we reuse it here.
 const clientUrl = process.env.CLIENT_URI || "http://localhost:3000";
-
-// ---------------------------------------------------------------------------
-// Database
-// ---------------------------------------------------------------------------
 
 const client = new MongoClient(process.env.MONGODB_URI);
 
@@ -59,7 +48,7 @@ export async function connectToDatabase() {
     return db;
   } catch (error) {
     console.error("Error connecting to database:", error);
-    // Fail fast: the route handlers cannot work without a database.
+
     throw error;
   }
 }
@@ -71,15 +60,10 @@ const favoritesCollection = db.collection("favorites");
 const bookingsCollection = db.collection("bookings");
 const paymentsCollection = db.collection("payments");
 
-// The app connects to MongoDB once at startup and stores it in `db`.
-// The payment functions use this helper to get that same connection.
 async function getDB() {
   return db;
 }
 
-// Older listings stored the price and quantity as strings, and a few used the
-// old `price`/`quantity` field names. Range filters and sorting only work on
-// numbers, so convert them once at startup. Running this again is harmless.
 async function normalizeEquipmentNumbers() {
   const items = await equipmentCollection
     .find({
@@ -115,22 +99,14 @@ async function normalizeEquipmentNumbers() {
 }
 await normalizeEquipmentNumbers();
 
-// A customer can favorite an item only once. The unique index also protects
-// against two rapid clicks racing each other.
 try {
   await favoritesCollection.createIndex(
     { userEmail: 1, equipmentId: 1 },
     { unique: true },
   );
 } catch (error) {
-  // Do not stop the API if the index already exists with different options or
-  // if legacy duplicate rows are present; the toggle route still checks first.
   console.error("Could not create the favorites index:", error);
 }
-
-// ---------------------------------------------------------------------------
-// Authentication and role middleware
-// ---------------------------------------------------------------------------
 
 const AUTH_URL = process.env.AUTH_URL;
 
@@ -138,8 +114,6 @@ if (!AUTH_URL) {
   throw new Error("AUTH_URL is required to verify access tokens.");
 }
 
-// Better Auth publishes its JWKS at this URL. createRemoteJWKSet caches the
-// keys and refreshes them when needed, so this is safe to create once.
 const JWKS = createRemoteJWKSet(new URL(`${AUTH_URL}/api/auth/jwks`));
 
 const verifyJwt = (token) =>
@@ -166,8 +140,6 @@ const verifyToken = async (req, res, next) => {
   }
 };
 
-// Get the user from an optional token. Used by the public details route:
-// guests have no token, logged-in users do.
 const getOptionalUser = async (req) => {
   const authHeader = req.headers.authorization;
 
@@ -184,9 +156,6 @@ const getOptionalUser = async (req) => {
   }
 };
 
-// These middleware functions run after verifyToken, so req.user already
-// exists. The role is inside the JWT, so we do not need another database
-// query on every request.
 const verifyAdmin = (req, res, next) => {
   if (req.user.role !== "admin") {
     return res.status(403).send({ message: "Forbidden: Admin only" });
@@ -208,26 +177,14 @@ const verifyRenter = (req, res, next) => {
   next();
 };
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-// User input is used inside a RegExp for the search filter. Escaping it stops
-// characters like "(" or "*" from throwing "Invalid regular expression".
 const escapeRegex = (value) =>
   String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-
-// ---------------------------------------------------------------------------
-// Health check
-// ---------------------------------------------------------------------------
 
 app.get("/", (req, res) => {
   res.send("Server is running");
 });
 
-// ---------------------------------------------------------------------------
 // Equipment routes
-// ---------------------------------------------------------------------------
 
 app.post("/equipment", async (req, res) => {
   // Coerce the two numeric fields so a manual API call cannot store strings
@@ -520,9 +477,7 @@ app.get("/equipment/:id", async (req, res) => {
   res.send(equipment);
 });
 
-// ---------------------------------------------------------------------------
 // Favorites routes (customer only)
-// ---------------------------------------------------------------------------
 
 // GET /favorites -> approved equipment saved by this customer, newest first.
 app.get("/favorites", verifyToken, verifyRenter, async (req, res) => {
@@ -579,8 +534,6 @@ app.get("/favorites/check", verifyToken, verifyRenter, async (req, res) => {
   }
 });
 
-// POST /favorites/toggle { equipmentId } -> add or remove in one call.
-// The unique index on { userEmail, equipmentId } prevents duplicates.
 app.post("/favorites/toggle", verifyToken, verifyRenter, async (req, res) => {
   const equipmentId = String(req.body?.equipmentId ?? "");
 
@@ -631,8 +584,6 @@ app.post("/favorites/toggle", verifyToken, verifyRenter, async (req, res) => {
   }
 });
 
-// DELETE /favorites/:equipmentId -> explicit remove used by the dashboard.
-// Deleting a missing favorite is still a success (idempotent).
 app.delete(
   "/favorites/:equipmentId",
   verifyToken,
@@ -658,20 +609,8 @@ app.delete(
   },
 );
 
-// ---------------------------------------------------------------------------
 // Profile and users
-// ---------------------------------------------------------------------------
 
-// This returns the profile of the logged-in user.
-app.get("/profile", verifyToken, async (req, res) => {
-  const user = await usersCollection.findOne({ email: req.user.email });
-
-  res.send(user);
-});
-
-// This lets an admin get all users. Only the fields the dashboard needs are
-// returned; password hashes live in the `account` collection and must never
-// leave the server.
 app.get("/users", verifyToken, verifyAdmin, async (req, res) => {
   try {
     const result = await usersCollection
@@ -755,10 +694,6 @@ app.patch("/users/:id/role", verifyToken, verifyAdmin, async (req, res) => {
   }
 });
 
-// ---------------------------------------------------------------------------
-// 404 and error handling
-// ---------------------------------------------------------------------------
-
 // ===== Stripe Webhook =====
 // This function is registered near the top of the file, before
 // express.json(), so req.body is still the raw Stripe payload.
@@ -788,13 +723,10 @@ async function handleStripeWebhook(req, res) {
   }
 }
 
-// Calculate the number of units (days, weeks, or months) between two dates.
 function getUnits(startDate, endDate, rentalType) {
   const days =
     Math.round((new Date(endDate) - new Date(startDate)) / 86400000) + 1;
 
-  // The equipment form saves rentalType as "Daily", "Weekly", or "Monthly".
-  // Lowercasing makes this comparison safe.
   const type = String(rentalType).toLowerCase();
 
   if (type === "weekly") return Math.ceil(days / 7);
@@ -821,9 +753,6 @@ async function getAvailableQuantity(equipment, startDate, endDate) {
   return Number(equipment.availableQuantity) - booked;
 }
 
-// Save the booking and payment in the database. Returns the payment document
-// or null if the payment was not successful. This is called from the Stripe
-// webhook, so it must be idempotent: the same session may be sent twice.
 async function saveBooking(session) {
   if (session.payment_status !== "paid") return null;
 
@@ -1086,7 +1015,7 @@ app.get("/bookings", verifyToken, verifyAdmin, async (req, res) => {
 
 // Logged-in user: own profile
 app.get("/profile", verifyToken, async (req, res) => {
-  const user = await userCollection.findOne({ email: req.user.email });
+  const user = await usersCollection.findOne({ email: req.user.email });
 
   if (!user) {
     return res.status(404).send({ message: "User not found" });
@@ -1118,7 +1047,7 @@ app.patch("/profile", verifyToken, async (req, res) => {
     },
   );
 
-  const updatedUser = await userCollection.findOne({ email: req.user.email });
+  const updatedUser = await usersCollection.findOne({ email: req.user.email });
   res.send(updatedUser);
 });
 
@@ -1235,6 +1164,7 @@ app.get("/analytics/admin", verifyToken, verifyAdmin, async (req, res) => {
     monthlyStats: monthly,
   });
 });
+
 // Unknown routes return JSON instead of Express's default HTML page, so the
 // client never tries to parse HTML as JSON.
 app.use((req, res) => {
@@ -1244,7 +1174,6 @@ app.use((req, res) => {
 // Express 5 forwards rejected async handlers here. Log the real error but do
 // not leak internals to the client.
 app.use((error, req, res, next) => {
-  // A malformed JSON body is a client error, not a server failure.
   if (error?.type === "entity.parse.failed") {
     return res.status(400).json({ message: "Invalid JSON body" });
   }
