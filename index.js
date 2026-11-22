@@ -325,6 +325,17 @@ app.get("/equipment", async (req, res) => {
   }
 });
 
+// Public six most recent approved equipment for the home page. Guests and customers see the same list.
+app.get("/equipment/featured", async (req, res) => {
+  const result = await equipmentCollection
+    .find({ status: "approved" })
+    .sort({ createdAt: -1 })
+    .limit(6)
+    .toArray();
+
+  res.send(result);
+});
+
 // The logged-in owner's equipment.
 app.get("/equipment/my", verifyToken, verifyOwner, async (req, res) => {
   const result = await equipmentCollection
