@@ -112,7 +112,6 @@ async function normalizeEquipmentNumbers() {
     console.log(`Normalized ${items.length} equipment record(s).`);
   }
 }
-
 await normalizeEquipmentNumbers();
 
 // A customer can favorite an item only once. The unique index also protects
@@ -335,6 +334,18 @@ app.get("/equipment/my", verifyToken, verifyOwner, async (req, res) => {
   res.send(result);
 });
 
+// Admin only: all equipment (pending, approved, rejected)
+app.get("/admin/equipment", verifyToken, verifyAdmin, async (req, res) => {
+  const { status } = req.query;
+  const query = status ? { status } : {};
+
+  const result = await equipmentCollection
+    .find(query)
+    .sort({ createdAt: -1 })
+    .toArray();
+
+  res.send(result);
+});
 // Admin only: approve or reject equipment.
 app.patch(
   "/equipment/:id/status",
