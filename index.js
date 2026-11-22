@@ -1124,12 +1124,62 @@ app.patch("/profile", verifyToken, async (req, res) => {
 
 // Logged-in owner: own bookings
 app.get("/bookings/owner", verifyToken, verifyOwner, async (req, res) => {
-  const result = await bookingCollection
+  const result = await bookingsCollection
     .find({ ownerEmail: req.user.email })
     .sort({ createdAt: -1 })
     .toArray();
 
   res.send(result);
+});
+
+// Logged-in owner: analytics
+app.get("/analytics/owner", verifyToken, verifyOwner, async (req, res) => {
+  const ownerEmail = req.user.email;
+  const today = new Date().toISOString().slice(0, 10);
+
+  const totalEquipment = await equipmentCollection.countDocuments({
+    ownerEmail,
+  });
+  const approvedEquipment = await equipmentCollection.countDocuments({
+    ownerEmail,
+    status: "approved",
+  });
+
+  const bookings = await bookingsCollection
+    .find({ ownerEmail, paymentStatus: "paid" })
+    .toArray();
+
+  // const completedRentals = bookings.filter(
+  //   (b) => b.bookingStatus === "completed" || b.endDate < today,
+  // ).length;
+
+  const totalEarnings = bookings.reduce((sum, b) => sum + b.totalAmount, 0);
+
+  const monthly = [];
+  for (let i = 5; i >= 0; i--) {
+    const date = new Date();
+    date.setDate(1);
+    date.setMonth(date.getMonth() - i);
+
+    const key = date.toISOString().slice(0, 7);
+    const earnings = bookings
+      .filter((b) => b.createdAt.slice(0, 7) === key)
+      .reduce((sum, b) => sum + b.totalAmount, 0);
+
+    monthly.push({
+      month: date.toLocaleDateString("en-US", { month: "short" }),
+      earnings,
+    });
+  }
+
+  res.send({
+    totalEquipment,
+    approvedEquipment,
+    totalBookings: bookings.length,
+    // completedRentals,
+    totalEarnings,
+    monthlyEarnings: monthly,
+  });
 });
 // Unknown routes return JSON instead of Express's default HTML page, so the
 // client never tries to parse HTML as JSON.
