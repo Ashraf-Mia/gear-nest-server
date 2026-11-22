@@ -68,6 +68,7 @@ await connectToDatabase();
 const usersCollection = db.collection("user");
 const equipmentCollection = db.collection("equipment");
 const favoritesCollection = db.collection("favorites");
+const bookingsCollection = db.collection("bookings");
 const paymentsCollection = db.collection("payments");
 
 // The app connects to MongoDB once at startup and stores it in `db`.
@@ -668,10 +669,90 @@ app.get("/profile", verifyToken, async (req, res) => {
   res.send(user);
 });
 
-// This lets an admin get all users.
+// This lets an admin get all users. Only the fields the dashboard needs are
+// returned; password hashes live in the `account` collection and must never
+// leave the server.
 app.get("/users", verifyToken, verifyAdmin, async (req, res) => {
-  const result = await usersCollection.find().toArray();
-  res.send(result);
+  try {
+    const result = await usersCollection
+      .find(
+        {},
+        {
+          projection: {
+            name: 1,
+            email: 1,
+            image: 1,
+            role: 1,
+            createdAt: 1,
+          },
+        },
+      )
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    res.send(result);
+  } catch (error) {
+    console.error("Failed to load users:", error);
+    res.status(500).send({ message: "Could not load users" });
+  }
+});
+
+// Admin only: change a user's role. The last admin cannot be demoted, otherwise
+// nobody would be left to approve equipment or manage users.
+app.patch("/users/:id/role", verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    if (!ObjectId.isValid(req.params.id)) {
+      return res.status(400).send({ message: "Invalid user id" });
+    }
+
+    const { role } = req.body;
+
+    if (!["customer", "owner", "admin"].includes(role)) {
+      return res.status(400).send({ message: "Invalid role" });
+    }
+
+    const userId = new ObjectId(req.params.id);
+    const user = await usersCollection.findOne({ _id: userId });
+
+    if (!user) {
+      return res.status(404).send({ message: "User not found" });
+    }
+
+    if (user.role === "admin" && role !== "admin") {
+      const adminCount = await usersCollection.countDocuments({
+        role: "admin",
+      });
+
+      if (adminCount <= 1) {
+        return res
+          .status(400)
+          .send({ message: "The last admin cannot be demoted" });
+      }
+    }
+
+    await usersCollection.updateOne(
+      { _id: userId },
+      { $set: { role, updatedAt: new Date() } },
+    );
+
+    const updatedUser = await usersCollection.findOne(
+      { _id: userId },
+      {
+        projection: {
+          name: 1,
+          email: 1,
+          image: 1,
+          role: 1,
+          createdAt: 1,
+        },
+      },
+    );
+
+    res.send(updatedUser);
+  } catch (error) {
+    console.error("Failed to update the user role:", error);
+    res.status(500).send({ message: "Could not update the role" });
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -953,6 +1034,53 @@ app.get("/bookings/my", verifyToken, verifyRenter, async (req, res) => {
   } catch (error) {
     console.log(error);
     res.status(500).send({ message: "Failed to load bookings" });
+  }
+});
+
+// Admin only: every booking on the platform. Owner names and equipment images
+// live on the equipment document, so they are joined in for the dashboard.
+app.get("/bookings", verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const bookings = await bookingsCollection
+      .find()
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    // `equipmentId` is stored as a string while `equipment._id` is an ObjectId,
+    // so the lookup needs an explicit conversion.
+    const equipmentIds = [
+      ...new Set(
+        bookings
+          .map((booking) => String(booking.equipmentId || ""))
+          .filter((id) => ObjectId.isValid(id)),
+      ),
+    ];
+
+    const equipment =
+      equipmentIds.length > 0
+        ? await equipmentCollection
+            .find({ _id: { $in: equipmentIds.map((id) => new ObjectId(id)) } })
+            .toArray()
+        : [];
+
+    const equipmentById = new Map(
+      equipment.map((item) => [item._id.toString(), item]),
+    );
+
+    const result = bookings.map((booking) => {
+      const item = equipmentById.get(String(booking.equipmentId || ""));
+
+      return {
+        ...booking,
+        ownerName: item?.ownerName ?? "",
+        equipmentImage: item?.image ?? "",
+      };
+    });
+
+    res.send(result);
+  } catch (error) {
+    console.error("Failed to load bookings:", error);
+    res.status(500).send({ message: "Could not load bookings" });
   }
 });
 
