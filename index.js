@@ -1181,6 +1181,60 @@ app.get("/analytics/owner", verifyToken, verifyOwner, async (req, res) => {
     monthlyEarnings: monthly,
   });
 });
+
+// Admin only analytics on dashboard
+app.get("/analytics/admin", verifyToken, verifyAdmin, async (req, res) => {
+  const today = new Date().toISOString().slice(0, 10);
+
+  const totalUsers = await usersCollection.countDocuments();
+  const totalEquipment = await equipmentCollection.countDocuments();
+  const totalBookings = await bookingsCollection.countDocuments();
+
+  const pendingApprovals = await equipmentCollection.countDocuments({
+    status: "pending",
+  });
+
+  const revenueResult = await paymentsCollection
+    .aggregate([{ $group: { _id: null, total: { $sum: "$amount" } } }])
+    .toArray();
+  const totalRevenue = revenueResult[0]?.total || 0;
+
+  const bookings = await bookingsCollection
+    .find({ paymentStatus: "paid" })
+    .toArray();
+
+  const completedRentals = bookings.filter(
+    (b) => b.bookingStatus === "completed" || b.endDate < today,
+  ).length;
+
+  const monthly = [];
+  for (let i = 5; i >= 0; i--) {
+    const date = new Date();
+    date.setDate(1);
+    date.setMonth(date.getMonth() - i);
+
+    const key = date.toISOString().slice(0, 7);
+    const monthBookings = bookings.filter(
+      (b) => b.createdAt.slice(0, 7) === key,
+    );
+
+    monthly.push({
+      month: date.toLocaleDateString("en-US", { month: "short" }),
+      bookings: monthBookings.length,
+      revenue: monthBookings.reduce((sum, b) => sum + b.totalAmount, 0),
+    });
+  }
+
+  res.send({
+    totalUsers,
+    totalEquipment,
+    totalBookings,
+    totalRevenue,
+    pendingApprovals,
+    completedRentals,
+    monthlyStats: monthly,
+  });
+});
 // Unknown routes return JSON instead of Express's default HTML page, so the
 // client never tries to parse HTML as JSON.
 app.use((req, res) => {
