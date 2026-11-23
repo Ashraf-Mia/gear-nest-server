@@ -361,77 +361,85 @@ app.patch(
 );
 
 // Update one equipment item. Its owner or an admin can update it.
-app.patch("/equipment/:id", verifyToken, verifyOwnerOrAdmin, async (req, res) => {
-  try {
-    if (!ObjectId.isValid(req.params.id)) {
-      return res.status(400).send({ message: "Invalid equipment id" });
-    }
+app.patch(
+  "/equipment/:id",
+  verifyToken,
+  verifyOwnerOrAdmin,
+  async (req, res) => {
+    try {
+      if (!ObjectId.isValid(req.params.id)) {
+        return res.status(400).send({ message: "Invalid equipment id" });
+      }
 
-    const equipmentId = new ObjectId(req.params.id);
-    const equipment = await equipmentCollection.findOne({ _id: equipmentId });
+      const equipmentId = new ObjectId(req.params.id);
+      const equipment = await equipmentCollection.findOne({ _id: equipmentId });
 
-    if (!equipment) {
-      return res.status(404).send({ message: "Equipment not found" });
-    }
+      if (!equipment) {
+        return res.status(404).send({ message: "Equipment not found" });
+      }
 
-    // An owner must not be able to update someone else's equipment, but an
-    // admin can moderate any listing.
-    if (req.user.role !== "admin" && equipment.ownerEmail !== req.user.email) {
-      return res
-        .status(403)
-        .send({ message: "You can only update your own equipment" });
-    }
+      // An owner must not be able to update someone else's equipment, but an
+      // admin can moderate any listing.
+      if (
+        req.user.role !== "admin" &&
+        equipment.ownerEmail !== req.user.email
+      ) {
+        return res
+          .status(403)
+          .send({ message: "You can only update your own equipment" });
+      }
 
-    // Only these fields can be changed from the dashboard.
-    const { name, category, rentalPrice, availableQuantity } = req.body;
+      // Only these fields can be changed from the dashboard.
+      const { name, category, rentalPrice, availableQuantity } = req.body;
 
-    const fieldsToUpdate = {};
-    if (name !== undefined) fieldsToUpdate.name = name;
-    if (category !== undefined) fieldsToUpdate.category = category;
+      const fieldsToUpdate = {};
+      if (name !== undefined) fieldsToUpdate.name = name;
+      if (category !== undefined) fieldsToUpdate.category = category;
 
-    // Numbers are enforced here too, so an edit cannot turn the price or
-    // quantity back into a string.
-    if (rentalPrice !== undefined) {
-      const value = Number(rentalPrice);
-      if (!Number.isFinite(value)) {
+      // Numbers are enforced here too, so an edit cannot turn the price or
+      // quantity back into a string.
+      if (rentalPrice !== undefined) {
+        const value = Number(rentalPrice);
+        if (!Number.isFinite(value)) {
+          return res
+            .status(400)
+            .send({ message: "rentalPrice must be a number" });
+        }
+        fieldsToUpdate.rentalPrice = value;
+      }
+      if (availableQuantity !== undefined) {
+        const value = Number(availableQuantity);
+        if (!Number.isFinite(value)) {
+          return res
+            .status(400)
+            .send({ message: "availableQuantity must be a number" });
+        }
+        fieldsToUpdate.availableQuantity = value;
+      }
+
+      if (Object.keys(fieldsToUpdate).length === 0) {
         return res
           .status(400)
-          .send({ message: "rentalPrice must be a number" });
+          .send({ message: "No valid fields provided to update" });
       }
-      fieldsToUpdate.rentalPrice = value;
+
+      await equipmentCollection.updateOne(
+        { _id: equipmentId },
+        { $set: fieldsToUpdate },
+      );
+
+      // Send the saved equipment back so the page can show the new values.
+      const updatedEquipment = await equipmentCollection.findOne({
+        _id: equipmentId,
+      });
+
+      res.send(updatedEquipment);
+    } catch (error) {
+      console.error("Failed to update equipment:", error);
+      res.status(500).send({ message: "Failed to update equipment" });
     }
-    if (availableQuantity !== undefined) {
-      const value = Number(availableQuantity);
-      if (!Number.isFinite(value)) {
-        return res
-          .status(400)
-          .send({ message: "availableQuantity must be a number" });
-      }
-      fieldsToUpdate.availableQuantity = value;
-    }
-
-    if (Object.keys(fieldsToUpdate).length === 0) {
-      return res
-        .status(400)
-        .send({ message: "No valid fields provided to update" });
-    }
-
-    await equipmentCollection.updateOne(
-      { _id: equipmentId },
-      { $set: fieldsToUpdate },
-    );
-
-    // Send the saved equipment back so the page can show the new values.
-    const updatedEquipment = await equipmentCollection.findOne({
-      _id: equipmentId,
-    });
-
-    res.send(updatedEquipment);
-  } catch (error) {
-    console.error("Failed to update equipment:", error);
-    res.status(500).send({ message: "Failed to update equipment" });
-  }
-});
+  },
+);
 
 // Delete one equipment item. Its owner or an admin can delete it.
 app.delete(
@@ -450,8 +458,6 @@ app.delete(
       return res.status(404).send({ message: "Equipment not found" });
     }
 
-    // An owner must not be able to delete someone else's equipment, but an
-    // admin can remove any listing.
     if (req.user.role !== "admin" && equipment.ownerEmail !== req.user.email) {
       return res
         .status(403)
@@ -464,9 +470,6 @@ app.delete(
   },
 );
 
-// Public: how many units are really free for a date range. The equipment
-// document only stores total stock, so overlapping bookings must be subtracted
-// before the details page can show a truthful availability status.
 app.get("/equipment/:id/availability", async (req, res) => {
   if (!ObjectId.isValid(req.params.id)) {
     return res.status(400).send({ message: "Invalid equipment id" });
@@ -510,7 +513,7 @@ app.get("/equipment/:id/availability", async (req, res) => {
       endDate,
       totalQuantity,
       bookedQuantity,
-      // What is left after other bookings for the same days.
+
       availableQuantity: Math.max(0, totalQuantity - bookedQuantity),
     });
   } catch (error) {
@@ -840,8 +843,6 @@ async function getBookedQuantity(equipmentId, startDate, endDate) {
 
   if (!startKey || !endKey || endKey < startKey) return null;
 
-  // `equipmentId` is stored as a string, but accept the ObjectId form too so
-  // legacy records are not silently ignored.
   const id = String(equipmentId);
   const idFilter = ObjectId.isValid(id) ? [id, new ObjectId(id)] : [id];
 
