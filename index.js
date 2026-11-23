@@ -448,6 +448,61 @@ app.delete("/equipment/:id", verifyToken, verifyOwner, async (req, res) => {
   res.send({ message: "Equipment deleted" });
 });
 
+// Public: how many units are really free for a date range. The equipment
+// document only stores total stock, so overlapping bookings must be subtracted
+// before the details page can show a truthful availability status.
+app.get("/equipment/:id/availability", async (req, res) => {
+  if (!ObjectId.isValid(req.params.id)) {
+    return res.status(400).send({ message: "Invalid equipment id" });
+  }
+
+  const startDate = toDayKey(req.query.startDate);
+  const endDate = toDayKey(req.query.endDate);
+
+  if (!startDate || !endDate) {
+    return res.status(400).send({
+      message: "startDate and endDate must be valid dates (YYYY-MM-DD)",
+    });
+  }
+
+  if (endDate < startDate) {
+    return res
+      .status(400)
+      .send({ message: "End date must be after start date" });
+  }
+
+  try {
+    const equipment = await equipmentCollection.findOne({
+      _id: new ObjectId(req.params.id),
+      status: "approved",
+    });
+
+    if (!equipment) {
+      return res.status(404).send({ message: "Equipment not found" });
+    }
+
+    const totalQuantity = Number(equipment.availableQuantity) || 0;
+    const bookedQuantity = await getBookedQuantity(
+      equipment._id,
+      startDate,
+      endDate,
+    );
+
+    res.json({
+      equipmentId: equipment._id.toString(),
+      startDate,
+      endDate,
+      totalQuantity,
+      bookedQuantity,
+      // What is left after other bookings for the same days.
+      availableQuantity: Math.max(0, totalQuantity - bookedQuantity),
+    });
+  } catch (error) {
+    console.error("Failed to check availability:", error);
+    res.status(500).send({ message: "Could not check availability" });
+  }
+});
+
 // Public details page. Pending or rejected equipment is only visible to its
 // owner and admins.
 app.get("/equipment/:id", async (req, res) => {
@@ -734,23 +789,78 @@ function getUnits(startDate, endDate, rentalType) {
   return days;
 }
 
-// Check how many units of the equipment are available for the requested dates.
-async function getAvailableQuantity(equipment, startDate, endDate) {
-  const database = await getDB();
-  const overlapping = await database
-    .collection("bookings")
+// Bookings store dates as "YYYY-MM-DD" strings, but older or manually created
+// records may hold Date objects. Normalising to one day key keeps the overlap
+// comparison reliable for both shapes.
+function toDayKey(value) {
+  if (!value) return null;
+
+  if (value instanceof Date) {
+    return Number.isNaN(value.getTime())
+      ? null
+      : value.toISOString().slice(0, 10);
+  }
+
+  const text = String(value).trim();
+
+  // "YYYY-MM-DD" and full ISO timestamps already start with the day.
+  if (/^\d{4}-\d{2}-\d{2}/.test(text)) return text.slice(0, 10);
+
+  const parsed = new Date(text);
+  return Number.isNaN(parsed.getTime())
+    ? null
+    : parsed.toISOString().slice(0, 10);
+}
+
+// A booking keeps its units reserved until it is cancelled. Unpaid/pending
+// records do not hold stock, so they are left out on purpose.
+const STOCK_HOLDING_BOOKING_STATUSES = ["confirmed", "active", "completed"];
+
+// Sum the quantities of this equipment's bookings that overlap the requested
+// dates. Returns null when the dates are invalid.
+async function getBookedQuantity(equipmentId, startDate, endDate) {
+  const startKey = toDayKey(startDate);
+  const endKey = toDayKey(endDate);
+
+  if (!startKey || !endKey || endKey < startKey) return null;
+
+  // `equipmentId` is stored as a string, but accept the ObjectId form too so
+  // legacy records are not silently ignored.
+  const id = String(equipmentId);
+  const idFilter = ObjectId.isValid(id) ? [id, new ObjectId(id)] : [id];
+
+  const bookings = await bookingsCollection
     .find({
-      equipmentId: equipment._id.toString(),
-      bookingStatus: "confirmed",
-      startDate: { $lte: endDate },
-      endDate: { $gte: startDate },
+      equipmentId: { $in: idFilter },
+      bookingStatus: { $in: STOCK_HOLDING_BOOKING_STATUSES },
     })
+    .project({ quantity: 1, startDate: 1, endDate: 1 })
     .toArray();
 
-  const booked = overlapping.reduce((sum, b) => sum + Number(b.quantity), 0);
+  return bookings
+    .filter((booking) => {
+      const bookingStart = toDayKey(booking.startDate);
+      const bookingEnd = toDayKey(booking.endDate);
+
+      // Overlap: existing.start <= requested.end AND existing.end >= requested.start
+      return Boolean(
+        bookingStart && bookingEnd && bookingStart <= endKey && bookingEnd >= startKey,
+      );
+    })
+    .reduce((sum, booking) => sum + (Number(booking.quantity) || 0), 0);
+}
+
+// How many units are actually free for the requested dates: total stock minus
+// every booking that overlaps those dates. Returns null for invalid dates.
+async function getAvailableQuantity(equipment, startDate, endDate) {
+  const booked = await getBookedQuantity(equipment._id, startDate, endDate);
+
+  if (booked === null) return null;
+
+  const total = Number(equipment.availableQuantity);
 
   // Equipment stores stock in `availableQuantity`, not `quantity`.
-  return Number(equipment.availableQuantity) - booked;
+  return Math.max(0, (Number.isFinite(total) ? total : 0) - booked);
 }
 
 async function saveBooking(session) {
@@ -778,6 +888,22 @@ async function saveBooking(session) {
     throw error;
   }
 
+  // Payment can complete minutes after checkout, so another customer may have
+  // taken the stock in the meantime. Confirm only when units are still free;
+  // otherwise keep the booking pending for manual handling/refund.
+  const equipment =
+    ObjectId.isValid(String(m.equipmentId)) && equipmentCollection
+      ? await equipmentCollection.findOne({
+          _id: new ObjectId(m.equipmentId),
+        })
+      : null;
+
+  const available = equipment
+    ? await getAvailableQuantity(equipment, m.startDate, m.endDate)
+    : null;
+
+  const hasStock = available !== null && Number(m.quantity) <= available;
+
   const result = await database.collection("bookings").insertOne({
     equipmentId: m.equipmentId,
     equipmentName: m.equipmentName,
@@ -792,7 +918,10 @@ async function saveBooking(session) {
     address: m.address,
     notes: m.notes,
     paymentStatus: "paid",
-    bookingStatus: "confirmed",
+    bookingStatus: hasStock ? "confirmed" : "pending",
+    // Flags a paid booking that could not be confirmed because the units were
+    // sold out by the time the payment completed.
+    availabilityIssue: !hasStock,
     createdAt: new Date().toISOString(),
   });
 
@@ -852,9 +981,16 @@ app.post("/bookings/checkout", verifyToken, verifyRenter, async (req, res) => {
     }
 
     const available = await getAvailableQuantity(equipment, startDate, endDate);
+
+    if (available === null) {
+      return res
+        .status(400)
+        .send({ message: "Start and end dates must be valid" });
+    }
+
     if (qty > available) {
-      return res.status(400).send({
-        message: `Only ${Math.max(available, 0)} available for these dates`,
+      return res.status(409).send({
+        message: `Only ${available} unit(s) available for these dates`,
       });
     }
 
