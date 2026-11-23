@@ -170,6 +170,15 @@ const verifyOwner = (req, res, next) => {
   next();
 };
 
+// Equipment can be edited by the owner of the record or by an admin, who may
+// moderate any listing. Ownership itself is still checked inside the route.
+const verifyOwnerOrAdmin = (req, res, next) => {
+  if (req.user.role !== "owner" && req.user.role !== "admin") {
+    return res.status(403).send({ message: "Forbidden: Owner or admin only" });
+  }
+  next();
+};
+
 const verifyRenter = (req, res, next) => {
   if (req.user.role !== "customer") {
     return res.status(403).send({ message: "Forbidden: Customer only" });
@@ -351,8 +360,8 @@ app.patch(
   },
 );
 
-// Update one equipment item. Only its owner can update it.
-app.patch("/equipment/:id", verifyToken, verifyOwner, async (req, res) => {
+// Update one equipment item. Its owner or an admin can update it.
+app.patch("/equipment/:id", verifyToken, verifyOwnerOrAdmin, async (req, res) => {
   try {
     if (!ObjectId.isValid(req.params.id)) {
       return res.status(400).send({ message: "Invalid equipment id" });
@@ -365,8 +374,9 @@ app.patch("/equipment/:id", verifyToken, verifyOwner, async (req, res) => {
       return res.status(404).send({ message: "Equipment not found" });
     }
 
-    // An owner must not be able to update someone else's equipment.
-    if (equipment.ownerEmail !== req.user.email) {
+    // An owner must not be able to update someone else's equipment, but an
+    // admin can moderate any listing.
+    if (req.user.role !== "admin" && equipment.ownerEmail !== req.user.email) {
       return res
         .status(403)
         .send({ message: "You can only update your own equipment" });
@@ -423,30 +433,36 @@ app.patch("/equipment/:id", verifyToken, verifyOwner, async (req, res) => {
   }
 });
 
-// Delete one equipment item. Only its owner can delete it.
-app.delete("/equipment/:id", verifyToken, verifyOwner, async (req, res) => {
-  if (!ObjectId.isValid(req.params.id)) {
-    return res.status(400).send({ message: "Invalid equipment id" });
-  }
+// Delete one equipment item. Its owner or an admin can delete it.
+app.delete(
+  "/equipment/:id",
+  verifyToken,
+  verifyOwnerOrAdmin,
+  async (req, res) => {
+    if (!ObjectId.isValid(req.params.id)) {
+      return res.status(400).send({ message: "Invalid equipment id" });
+    }
 
-  const equipmentId = new ObjectId(req.params.id);
-  const equipment = await equipmentCollection.findOne({ _id: equipmentId });
+    const equipmentId = new ObjectId(req.params.id);
+    const equipment = await equipmentCollection.findOne({ _id: equipmentId });
 
-  if (!equipment) {
-    return res.status(404).send({ message: "Equipment not found" });
-  }
+    if (!equipment) {
+      return res.status(404).send({ message: "Equipment not found" });
+    }
 
-  // An owner must not be able to delete someone else's equipment.
-  if (equipment.ownerEmail !== req.user.email) {
-    return res
-      .status(403)
-      .send({ message: "You can only delete your own equipment" });
-  }
+    // An owner must not be able to delete someone else's equipment, but an
+    // admin can remove any listing.
+    if (req.user.role !== "admin" && equipment.ownerEmail !== req.user.email) {
+      return res
+        .status(403)
+        .send({ message: "You can only delete your own equipment" });
+    }
 
-  await equipmentCollection.deleteOne({ _id: equipmentId });
+    await equipmentCollection.deleteOne({ _id: equipmentId });
 
-  res.send({ message: "Equipment deleted" });
-});
+    res.send({ message: "Equipment deleted" });
+  },
+);
 
 // Public: how many units are really free for a date range. The equipment
 // document only stores total stock, so overlapping bookings must be subtracted
