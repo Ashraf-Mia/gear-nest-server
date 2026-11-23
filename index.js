@@ -844,7 +844,10 @@ async function getBookedQuantity(equipmentId, startDate, endDate) {
 
       // Overlap: existing.start <= requested.end AND existing.end >= requested.start
       return Boolean(
-        bookingStart && bookingEnd && bookingStart <= endKey && bookingEnd >= startKey,
+        bookingStart &&
+        bookingEnd &&
+        bookingStart <= endKey &&
+        bookingEnd >= startKey,
       );
     })
     .reduce((sum, booking) => sum + (Number(booking.quantity) || 0), 0);
@@ -859,7 +862,6 @@ async function getAvailableQuantity(equipment, startDate, endDate) {
 
   const total = Number(equipment.availableQuantity);
 
-  // Equipment stores stock in `availableQuantity`, not `quantity`.
   return Math.max(0, (Number.isFinite(total) ? total : 0) - booked);
 }
 
